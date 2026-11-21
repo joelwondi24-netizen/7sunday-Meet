@@ -166,6 +166,20 @@ export interface MeetingAttendance {
   createdAt?: any;
 }
 
+export interface MeetingTranscriptEntry {
+  id: string;
+  meetingCode: string;
+  speakerUid: string;
+  speakerName: string;
+  text: string;
+  language?: string;
+  source: 'gemini_ai' | 'gemini_summary' | 'manual_note';
+  meetingScope: MeetingScope;
+  participantUids?: string[];
+  timestampLabel: string;
+  createdAt?: any;
+}
+
 export interface Participant {
   id: string;
   name: string;

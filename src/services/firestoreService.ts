@@ -32,6 +32,8 @@ import {
   IntegrationConfig,
   Meeting,
   MeetingAttendance,
+  MeetingScope,
+  MeetingTranscriptEntry,
   ModerationReason,
   ModerationReport,
   NotificationItem,
@@ -1484,5 +1486,121 @@ export async function triggerManualSyncCheck(uid: string): Promise<string> {
     return ts;
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `users/${uid}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live AI Meeting Transcripts (/meeting_transcripts/{entryId})
+// ---------------------------------------------------------------------------
+export async function saveMeetingTranscriptEntry(params: {
+  id?: string;
+  meetingCode: string;
+  speakerUid: string;
+  speakerName: string;
+  text: string;
+  language?: string;
+  source: 'gemini_ai' | 'gemini_summary' | 'manual_note';
+  meetingScope: MeetingScope;
+  participantUids?: string[];
+  timestampLabel: string;
+}): Promise<MeetingTranscriptEntry> {
+  const id = params.id ? sanitizeId(params.id) : makeId('trn');
+  const participantUids = Array.from(
+    new Set([params.speakerUid, ...(params.participantUids || [])].filter(Boolean).map(sanitizeId))
+  ).slice(0, 100);
+
+  const payload: MeetingTranscriptEntry = {
+    id,
+    meetingCode: sanitizeId(params.meetingCode).slice(0, 64),
+    speakerUid: sanitizeId(params.speakerUid),
+    speakerName: clampStr(params.speakerName, 120) || 'Participant',
+    text: clampStr(params.text, 4000),
+    language: clampStr(params.language || 'auto', 32),
+    source: params.source,
+    meetingScope: params.meetingScope,
+    participantUids,
+    timestampLabel: clampStr(params.timestampLabel, 32) || '00:00',
+    createdAt: serverTimestamp(),
+  };
+
+  try {
+    await setDoc(doc(db, 'meeting_transcripts', id), payload);
+    return payload;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `meeting_transcripts/${id}`);
+  }
+}
+
+export function subscribeMeetingTranscripts(
+  meetingCode: string,
+  user: { uid: string; accountType?: AccountType },
+  cb: (entries: MeetingTranscriptEntry[]) => void
+) {
+  const path = 'meeting_transcripts';
+  const cleanCode = sanitizeId(meetingCode).slice(0, 64);
+
+  const sortEntries = (docs: MeetingTranscriptEntry[]) =>
+    docs.sort((a, b) => {
+      const ta = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+      const tb = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+      if (ta !== tb) return ta - tb;
+      return a.id.localeCompare(b.id);
+    });
+
+  if (user.accountType === 'customer') {
+    let spokenByMe: MeetingTranscriptEntry[] = [];
+    let sharedWithMe: MeetingTranscriptEntry[] = [];
+    const emit = () => {
+      const merged = new Map<string, MeetingTranscriptEntry>();
+      [...spokenByMe, ...sharedWithMe].forEach((e) => merged.set(e.id, e));
+      cb(sortEntries(Array.from(merged.values())));
+    };
+
+    const u1 = onSnapshot(
+      query(
+        collection(db, path),
+        where('meetingCode', '==', cleanCode),
+        where('speakerUid', '==', user.uid),
+        limit(200)
+      ),
+      (snap) => {
+        spokenByMe = snap.docs.map((d) => d.data() as MeetingTranscriptEntry);
+        emit();
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, path)
+    );
+
+    const u2 = onSnapshot(
+      query(
+        collection(db, path),
+        where('meetingCode', '==', cleanCode),
+        where('participantUids', 'array-contains', user.uid),
+        limit(200)
+      ),
+      (snap) => {
+        sharedWithMe = snap.docs.map((d) => d.data() as MeetingTranscriptEntry);
+        emit();
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, path)
+    );
+
+    return () => {
+      u1();
+      u2();
+    };
+  }
+
+  return onSnapshot(
+    query(collection(db, path), where('meetingCode', '==', cleanCode), limit(250)),
+    (snap) => cb(sortEntries(snap.docs.map((d) => d.data() as MeetingTranscriptEntry))),
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
+  );
+}
+
+export async function deleteMeetingTranscriptEntry(entryId: string) {
+  try {
+    await deleteDoc(doc(db, 'meeting_transcripts', entryId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `meeting_transcripts/${entryId}`);
   }
 }

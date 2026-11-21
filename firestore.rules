@@ -278,6 +278,29 @@ service cloud.firestore {
       data.createdAt is timestamp;
     }
 
+    function isValidMeetingTranscript(data, entryId) {
+      return data.keys().hasAll([
+        'id', 'meetingCode', 'speakerUid', 'speakerName', 'text',
+        'source', 'meetingScope', 'timestampLabel', 'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'meetingCode', 'speakerUid', 'speakerName', 'text',
+        'language', 'source', 'meetingScope', 'participantUids',
+        'timestampLabel', 'createdAt'
+      ]) &&
+      isValidId(data.id) && data.id == entryId &&
+      data.meetingCode is string && data.meetingCode.size() >= 3 && data.meetingCode.size() <= 64 && data.meetingCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+      isValidId(data.speakerUid) &&
+      data.speakerName is string && data.speakerName.size() >= 1 && data.speakerName.size() <= 120 &&
+      data.text is string && data.text.size() >= 1 && data.text.size() <= 4000 &&
+      isValidOptionalString(data, 'language', 32) &&
+      data.source in ['gemini_ai', 'gemini_summary', 'manual_note'] &&
+      data.meetingScope in ['internal', 'customer', 'external'] &&
+      isValidStringList(data, 'participantUids', 100) &&
+      data.timestampLabel is string && data.timestampLabel.size() >= 1 && data.timestampLabel.size() <= 32 &&
+      data.createdAt is timestamp;
+    }
+
     function isValidChatConversation(data, chatId) {
       return data.keys().hasAll(['id', 'chatScope', 'memberUids', 'createdAt', 'updatedAt']) &&
         data.keys().hasOnly([
@@ -718,6 +741,40 @@ service cloud.firestore {
         incoming().createdAt == existing().createdAt &&
         incoming().diff(existing()).affectedKeys().hasOnly(['leftAt', 'durationSeconds']);
       allow delete: if isValidId(recordId) && isAdmin();
+    }
+
+    // 7b. /meeting_transcripts/{entryId} - Live AI meeting transcripts
+    match /meeting_transcripts/{entryId} {
+      allow get: if isValidId(entryId) && isVerified() && (
+        isEmployeeOrAdmin() ||
+        (existing().meetingScope in ['customer', 'external'] && (
+          existing().speakerUid == request.auth.uid ||
+          ('participantUids' in existing() && request.auth.uid in existing().participantUids)
+        ))
+      );
+
+      allow list: if isVerified() && (
+        isEmployeeOrAdmin() ||
+        (resource.data.meetingScope in ['customer', 'external'] && (
+          resource.data.speakerUid == request.auth.uid ||
+          ('participantUids' in resource.data && request.auth.uid in resource.data.participantUids)
+        ))
+      );
+
+      allow create: if isValidId(entryId) &&
+        isVerified() &&
+        isValidMeetingTranscript(incoming(), entryId) &&
+        incoming().speakerUid == request.auth.uid &&
+        incoming().createdAt == request.time && (
+          isEmployeeOrAdmin() ||
+          (isCustomer() && incoming().meetingScope in ['customer', 'external'])
+        );
+
+      allow update: if false;
+
+      allow delete: if isValidId(entryId) && isVerified() && (
+        isAdmin() || existing().speakerUid == request.auth.uid
+      );
     }
 
     // 8. /chats/{chatId} & /messages/{msgId} - Strict Scope Isolation + Master Gate

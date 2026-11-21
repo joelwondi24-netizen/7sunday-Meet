@@ -8,6 +8,7 @@ import {
   Download,
   Eye,
   File as FileIcon,
+  FileText,
   Hand,
   Lock,
   MessageSquare,
@@ -19,8 +20,11 @@ import {
   PenTool,
   Phone,
   PhoneOff,
+  Search,
   Send,
   Smile,
+  Sparkles,
+  Trash2,
   Unlock,
   Users,
   Video,
@@ -31,22 +35,35 @@ import {
 import { auth } from '../lib/firebase';
 import { api } from '../services/api';
 import {
+  deleteMeetingTranscriptEntry,
+  makeId,
   recordMeetingAttendanceJoin,
   recordMeetingAttendanceLeave,
+  saveMeetingTranscriptEntry,
+  subscribeMeetingTranscripts,
   updateOwnProfile,
 } from '../services/firestoreService';
 import { realtime } from '../services/websocket';
-import { Participant, Poll, PresenceStatus } from '../types';
+import {
+  AccountType,
+  MeetingScope,
+  MeetingTranscriptEntry,
+  Participant,
+  Poll,
+  PresenceStatus,
+} from '../types';
 import { DocumentPreviewModal, formatFileSize } from './DocumentPreviewModal';
 import { Whiteboard } from './Whiteboard';
 
 interface MeetingRoomProps {
   meetingCode: string;
+  meetingScope?: MeetingScope;
   currentUser: {
     uid: string;
     displayName: string;
     email: string;
     role: string;
+    accountType?: AccountType;
     avatarUrl?: string;
     isAuthenticated: boolean;
     dndMode?: boolean;
@@ -60,6 +77,7 @@ interface MeetingRoomProps {
 
 export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   meetingCode,
+  meetingScope,
   currentUser,
   initialPassword,
   initialCallMode = 'video',
@@ -90,7 +108,8 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const [joinError, setJoinError] = useState<string | null>(null);
 
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [activeSidePanel, setActiveSidePanel] = useState<'none' | 'chat' | 'participants' | 'polls'>('none');
+  const participantsRef = useRef<Participant[]>([]);
+  const [activeSidePanel, setActiveSidePanel] = useState<'none' | 'chat' | 'participants' | 'polls' | 'transcript'>('none');
   const [showWhiteboard, setShowWhiteboard] = useState(false);
   const [showReactions, setShowReactions] = useState(false);
   const [floatingReactions, setFloatingReactions] = useState<{ id: string; emoji: string; name: string }[]>([]);
@@ -108,6 +127,21 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const [polls, setPolls] = useState<Poll[]>([]);
   const [newPollQuestion, setNewPollQuestion] = useState('');
   const [newPollOptions] = useState(['Yes', 'No']);
+
+  // Live AI Transcript state
+  const [resolvedScope, setResolvedScope] = useState<MeetingScope>(
+    meetingScope || (currentUser.accountType === 'customer' ? 'customer' : 'external')
+  );
+  const [firestoreTranscripts, setFirestoreTranscripts] = useState<MeetingTranscriptEntry[]>([]);
+  const [wsTranscripts, setWsTranscripts] = useState<MeetingTranscriptEntry[]>([]);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [isProcessingChunk, setIsProcessingChunk] = useState(false);
+  const [isSummarizing, setIsSummarizing] = useState(false);
+  const [transcriptLanguage, setTranscriptLanguage] = useState<'auto' | 'English' | 'Amharic'>('auto');
+  const [transcriptSearch, setTranscriptSearch] = useState('');
+  const [manualNoteInput, setManualNoteInput] = useState('');
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const transcriptEndRef = useRef<HTMLDivElement | null>(null);
 
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [copiedLink, setCopiedLink] = useState(false);
@@ -181,6 +215,13 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     const init = async () => {
       try {
         const meta = await api.getRoomMeta(meetingCode).catch(() => null);
+        if (meta?.meetingScope && !meetingScope) {
+          setResolvedScope(
+            currentUser.accountType === 'customer' && meta.meetingScope === 'internal'
+              ? 'customer'
+              : meta.meetingScope
+          );
+        }
         if (meta?.callMode === 'audio' && initialCallMode !== 'video') {
           resolvedCallMode = 'audio';
           setCallMode('audio');
@@ -293,6 +334,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       setPasswordNeeded(false);
       setParticipants(data.participants || []);
       setMessages(data.chatHistory || []);
+      if (Array.isArray(data.transcripts)) setWsTranscripts(data.transcripts);
       setPolls(data.polls || []);
       setIsLocked(Boolean(data.isLocked));
       setWaitingList(data.waitingList || []);
@@ -310,6 +352,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       setInWaitingRoom(false);
       setParticipants(data.participants || []);
       setMessages(data.chatHistory || []);
+      if (Array.isArray(data.transcripts)) setWsTranscripts(data.transcripts);
       setPolls(data.polls || []);
     });
 
@@ -396,6 +439,14 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       onLeave();
     });
 
+    const uTranscript = realtime.on('transcript-entry-added', (data) => {
+      if (data.entry) {
+        setWsTranscripts((prev) =>
+          prev.some((e) => e.id === data.entry.id) ? prev : [...prev, data.entry]
+        );
+      }
+    });
+
     const uLockStatus = realtime.on('room-lock-status', (d) => setIsLocked(Boolean(d.isLocked)));
 
     return () => {
@@ -420,6 +471,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       uReaction();
       uForceMute();
       uKicked();
+      uTranscript();
       uLockStatus();
 
       peerConnectionsRef.current.forEach((pc) => pc.close());
@@ -434,6 +486,207 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       }
     };
   }, [meetingCode]);
+
+  useEffect(() => {
+    participantsRef.current = participants;
+  }, [participants]);
+
+  // Subscribe to persistent Firestore live transcript entries for authenticated participants
+  useEffect(() => {
+    if (!currentUser.isAuthenticated) return;
+    const unsub = subscribeMeetingTranscripts(
+      meetingCode,
+      { uid: currentUser.uid, accountType: currentUser.accountType },
+      (entries) => setFirestoreTranscripts(entries)
+    );
+    return () => unsub();
+  }, [meetingCode, currentUser.uid, currentUser.isAuthenticated, currentUser.accountType]);
+
+  // Merged chronological transcript feed (Firestore authoritative + real-time WebSocket fallback)
+  const mergedTranscripts: MeetingTranscriptEntry[] = React.useMemo(() => {
+    const map = new Map<string, MeetingTranscriptEntry>();
+    wsTranscripts.forEach((e) => map.set(e.id, e));
+    firestoreTranscripts.forEach((e) => map.set(e.id, e));
+    return Array.from(map.values()).sort((a, b) => {
+      const ta = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+      const tb = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+      if (ta && tb && ta !== tb) return ta - tb;
+      return a.id.localeCompare(b.id);
+    });
+  }, [firestoreTranscripts, wsTranscripts]);
+
+  useEffect(() => {
+    if (activeSidePanel === 'transcript') {
+      transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [mergedTranscripts.length, activeSidePanel]);
+
+  const persistAndBroadcastTranscript = async (
+    text: string,
+    source: 'gemini_ai' | 'gemini_summary' | 'manual_note',
+    speakerNameOverride?: string
+  ) => {
+    const id = makeId('trn');
+    const timestampLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const participantUids = Array.from(
+      new Set([
+        currentUser.uid,
+        ...participantsRef.current.filter((p) => p.role !== 'guest').map((p) => p.id),
+      ])
+    );
+
+    const localEntry: MeetingTranscriptEntry = {
+      id,
+      meetingCode,
+      speakerUid: currentUser.uid,
+      speakerName: speakerNameOverride || currentUser.displayName,
+      text,
+      language: transcriptLanguage,
+      source,
+      meetingScope: resolvedScope,
+      participantUids,
+      timestampLabel,
+    };
+
+    setWsTranscripts((prev) => (prev.some((e) => e.id === id) ? prev : [...prev, localEntry]));
+    realtime.send('transcript-entry', meetingCode, { entry: localEntry });
+
+    if (currentUser.isAuthenticated) {
+      await saveMeetingTranscriptEntry({
+        id,
+        meetingCode,
+        speakerUid: currentUser.uid,
+        speakerName: speakerNameOverride || currentUser.displayName,
+        text,
+        language: transcriptLanguage,
+        source,
+        meetingScope: resolvedScope,
+        participantUids,
+        timestampLabel,
+      });
+    }
+  };
+
+  // Rolling AI audio chunk capture & Gemini transcription loop
+  useEffect(() => {
+    if (!isTranscribing || !currentUser.isAuthenticated || !isMicOn) return;
+    const activeAudioTrack = localStreamRef.current?.getAudioTracks().find((t) => t.readyState === 'live');
+    if (!activeAudioTrack) return;
+
+    let cancelled = false;
+    let sliceRecorder: MediaRecorder | null = null;
+    let sliceTimeout: ReturnType<typeof setTimeout> | null = null;
+    let audioCtx: AudioContext | null = null;
+    let analyser: AnalyserNode | null = null;
+    let rmsInterval: ReturnType<typeof setInterval> | null = null;
+    let maxRms = 0;
+
+    const audioOnlyStream = new MediaStream([activeAudioTrack]);
+    const preferredMime =
+      ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'].find((m) =>
+        typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)
+      ) || '';
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        audioCtx = new AudioCtx();
+        const source = audioCtx.createMediaStreamSource(audioOnlyStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        const samples = new Uint8Array(analyser.fftSize);
+        rmsInterval = setInterval(() => {
+          if (!analyser) return;
+          analyser.getByteTimeDomainData(samples);
+          let sumSq = 0;
+          for (let i = 0; i < samples.length; i++) {
+            const norm = (samples[i] - 128) / 128;
+            sumSq += norm * norm;
+          }
+          const rms = Math.sqrt(sumSq / samples.length);
+          if (rms > maxRms) maxRms = rms;
+        }, 120);
+      }
+    } catch {
+      // Fallback without WebAudio RMS gating
+    }
+
+    const startNextSlice = () => {
+      if (cancelled || typeof MediaRecorder === 'undefined') return;
+      maxRms = 0;
+      const chunks: Blob[] = [];
+      try {
+        sliceRecorder = preferredMime
+          ? new MediaRecorder(audioOnlyStream, { mimeType: preferredMime })
+          : new MediaRecorder(audioOnlyStream);
+      } catch {
+        setTranscriptError('Audio recording for AI transcription is not supported in this browser.');
+        setIsTranscribing(false);
+        return;
+      }
+
+      sliceRecorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+      };
+
+      sliceRecorder.onstop = async () => {
+        const hadVoiceEnergy = !analyser || maxRms > 0.005;
+        const blob = new Blob(chunks, { type: sliceRecorder?.mimeType || preferredMime || 'audio/webm' });
+
+        if (!cancelled) {
+          startNextSlice();
+        }
+
+        if (!hadVoiceEnergy || blob.size < 1800) {
+          return;
+        }
+
+        setIsProcessingChunk(true);
+        try {
+          const result = await api.transcribeMeetingAudio({
+            audioBlob: blob,
+            meetingCode,
+            speakerName: currentUser.displayName,
+            languageHint: transcriptLanguage,
+          });
+          setTranscriptError(null);
+          if (!result.isEmpty && result.text.trim()) {
+            await persistAndBroadcastTranscript(result.text.trim(), 'gemini_ai');
+          }
+        } catch (err: any) {
+          setTranscriptError(err?.message || 'AI transcription failed.');
+        } finally {
+          setIsProcessingChunk(false);
+        }
+      };
+
+      sliceRecorder.start();
+      sliceTimeout = setTimeout(() => {
+        if (sliceRecorder && sliceRecorder.state === 'recording') {
+          sliceRecorder.stop();
+        }
+      }, 5500);
+    };
+
+    startNextSlice();
+
+    return () => {
+      cancelled = true;
+      if (sliceTimeout) clearTimeout(sliceTimeout);
+      if (rmsInterval) clearInterval(rmsInterval);
+      if (sliceRecorder && sliceRecorder.state === 'recording') {
+        try {
+          sliceRecorder.stop();
+        } catch {
+          // ignore stop race
+        }
+      }
+      if (audioCtx && audioCtx.state !== 'closed') {
+        audioCtx.close().catch(() => {});
+      }
+    };
+  }, [isTranscribing, isMicOn, localStream, meetingCode, transcriptLanguage, currentUser.isAuthenticated]);
 
   const toggleMic = () => {
     if (!localStream) return;
@@ -708,6 +961,12 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           {isRecording && (
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-600/20 text-rose-400 text-[10px] font-bold animate-pulse shrink-0">
               REC<span className="hidden md:inline"> (Consent Active)</span>
+            </span>
+          )}
+          {isTranscribing && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold shrink-0">
+              <Sparkles className="w-3 h-3 animate-pulse" />
+              <span className="hidden sm:inline">AI Transcript</span>
             </span>
           )}
         </div>
@@ -1086,6 +1345,241 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
                 )}
               </div>
             )}
+
+            {activeSidePanel === 'transcript' && (
+              <>
+                {/* AI Transcription Controls Bar */}
+                <div className="p-3 border-b border-slate-800 bg-slate-950/60 space-y-2.5 shrink-0">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    {currentUser.isAuthenticated ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTranscriptError(null);
+                          if (!isTranscribing && !localStreamRef.current?.getAudioTracks().length) {
+                            setTranscriptError('Microphone audio track is required to capture AI transcription.');
+                            return;
+                          }
+                          setIsTranscribing((v) => !v);
+                        }}
+                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-colors ${
+                          isTranscribing
+                            ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                            : 'bg-sky-600 hover:bg-sky-500 text-white'
+                        }`}
+                      >
+                        <Sparkles className={`w-3.5 h-3.5 ${isTranscribing ? 'animate-pulse' : ''}`} />
+                        <span>{isTranscribing ? 'Stop AI Capture' : 'Start AI Transcript'}</span>
+                      </button>
+                    ) : (
+                      <span className="text-[11px] text-slate-400">
+                        Viewing live meeting transcript
+                      </span>
+                    )}
+
+                    <div className="flex items-center gap-1.5">
+                      {currentUser.isAuthenticated && (
+                        <select
+                          value={transcriptLanguage}
+                          onChange={(e) => setTranscriptLanguage(e.target.value as 'auto' | 'English' | 'Amharic')}
+                          className="px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-200 focus:outline-none"
+                          title="Spoken language hint"
+                        >
+                          <option value="auto">Auto Lang</option>
+                          <option value="English">English</option>
+                          <option value="Amharic">Amharic</option>
+                        </select>
+                      )}
+
+                      {currentUser.isAuthenticated && mergedTranscripts.length > 0 && (
+                        <button
+                          type="button"
+                          disabled={isSummarizing}
+                          onClick={async () => {
+                            setIsSummarizing(true);
+                            setTranscriptError(null);
+                            try {
+                              const { summary } = await api.summarizeMeetingTranscript({
+                                meetingCode,
+                                entries: mergedTranscripts.map((e) => ({
+                                  speakerName: e.speakerName,
+                                  timestampLabel: e.timestampLabel,
+                                  text: e.text,
+                                })),
+                              });
+                              await persistAndBroadcastTranscript(summary, 'gemini_summary', '7Sunday AI Summary');
+                            } catch (err: any) {
+                              setTranscriptError(err?.message || 'Unable to generate AI summary.');
+                            } finally {
+                              setIsSummarizing(false);
+                            }
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 text-[11px] font-semibold disabled:opacity-50"
+                          title="Generate AI Summary & Action Items"
+                        >
+                          {isSummarizing ? 'Summarizing...' : 'AI Summary'}
+                        </button>
+                      )}
+
+                      {mergedTranscripts.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const content = mergedTranscripts
+                              .map((e) => `[${e.timestampLabel}] ${e.speakerName} (${e.source}):\n${e.text}`)
+                              .join('\n\n');
+                            const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = `7Sunday-Transcript-${meetingCode}.txt`;
+                            a.click();
+                            URL.revokeObjectURL(url);
+                          }}
+                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+                          title="Download Transcript (.txt)"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Status / Mic Indicator */}
+                  {isTranscribing && (
+                    <div className="flex items-center justify-between text-[11px] text-slate-400">
+                      <span className="flex items-center gap-1.5">
+                        <span className={`w-2 h-2 rounded-full ${isMicOn ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+                        {!isMicOn
+                          ? 'Mic muted — unmute to transcribe'
+                          : isProcessingChunk
+                          ? 'Gemini AI transcribing speech...'
+                          : 'Listening & saving to Firestore'}
+                      </span>
+                    </div>
+                  )}
+
+                  {transcriptError && (
+                    <div className="p-2 rounded-lg bg-rose-500/15 border border-rose-500/30 text-[11px] text-rose-300">
+                      {transcriptError}
+                    </div>
+                  )}
+
+                  {/* Transcript Search */}
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2" />
+                    <input
+                      type="text"
+                      value={transcriptSearch}
+                      onChange={(e) => setTranscriptSearch(e.target.value)}
+                      placeholder="Search transcript or speaker..."
+                      className="w-full pl-8 pr-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                    />
+                  </div>
+                </div>
+
+                {/* Live Transcript Feed */}
+                <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
+                  {mergedTranscripts.length === 0 ? (
+                    <div className="text-center py-8 px-3 space-y-2">
+                      <FileText className="w-8 h-8 text-slate-600 mx-auto" />
+                      <p className="text-xs font-semibold text-slate-300">No transcript entries yet</p>
+                      <p className="text-[11px] text-slate-500 leading-relaxed">
+                        {currentUser.isAuthenticated
+                          ? 'Click "Start AI Transcript" above to capture live speech with Gemini AI and save directly to Firestore.'
+                          : 'Transcript entries captured by meeting participants will appear here live.'}
+                      </p>
+                    </div>
+                  ) : (
+                    mergedTranscripts
+                      .filter((entry) => {
+                        if (!transcriptSearch.trim()) return true;
+                        const q = transcriptSearch.trim().toLowerCase();
+                        return (
+                          entry.text.toLowerCase().includes(q) ||
+                          entry.speakerName.toLowerCase().includes(q)
+                        );
+                      })
+                      .map((entry) => {
+                        const isSummary = entry.source === 'gemini_summary';
+                        const isManual = entry.source === 'manual_note';
+                        return (
+                          <div
+                            key={entry.id}
+                            className={`p-2.5 rounded-xl border text-xs space-y-1.5 ${
+                              isSummary
+                                ? 'bg-indigo-950/40 border-indigo-500/40'
+                                : 'bg-slate-950 border-slate-800'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2 text-[10px]">
+                              <div className="flex items-center gap-1.5 min-w-0">
+                                <span className={`font-bold truncate ${isSummary ? 'text-indigo-300' : 'text-sky-400'}`}>
+                                  {entry.speakerName}
+                                </span>
+                                <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 text-[9px] uppercase font-semibold shrink-0">
+                                  {isSummary ? 'AI Summary' : isManual ? 'Note' : 'AI'}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0 text-slate-500">
+                                <span className="tabular-nums">{entry.timestampLabel}</span>
+                                {currentUser.isAuthenticated &&
+                                  (entry.speakerUid === currentUser.uid ||
+                                    ['Super Administrator', 'Company Administrator'].includes(currentUser.role)) && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setWsTranscripts((prev) => prev.filter((e) => e.id !== entry.id));
+                                        deleteMeetingTranscriptEntry(entry.id).catch(() => {});
+                                      }}
+                                      className="p-0.5 text-slate-500 hover:text-rose-400"
+                                      title="Delete transcript entry"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  )}
+                              </div>
+                            </div>
+                            <p className="text-slate-200 whitespace-pre-wrap leading-relaxed break-words">
+                              {entry.text}
+                            </p>
+                          </div>
+                        );
+                      })
+                  )}
+                  <div ref={transcriptEndRef} />
+                </div>
+
+                {/* Timestamped Manual Note Composer (Authenticated Users) */}
+                {currentUser.isAuthenticated && (
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      if (!manualNoteInput.trim()) return;
+                      const note = manualNoteInput.trim();
+                      setManualNoteInput('');
+                      try {
+                        await persistAndBroadcastTranscript(note, 'manual_note');
+                      } catch (err: any) {
+                        setTranscriptError(err?.message || 'Failed to save transcript note.');
+                      }
+                    }}
+                    className="p-3 border-t border-slate-800 flex items-center gap-2 shrink-0"
+                  >
+                    <input
+                      type="text"
+                      value={manualNoteInput}
+                      onChange={(e) => setManualNoteInput(e.target.value)}
+                      placeholder="Add manual note to transcript..."
+                      className="flex-1 min-w-0 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs"
+                    />
+                    <button type="submit" className="p-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white shrink-0" title="Save Note">
+                      <Send className="w-4 h-4" />
+                    </button>
+                  </form>
+                )}
+              </>
+            )}
           </aside>
         )}
       </div>
@@ -1201,6 +1695,23 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           title="Polls"
         >
           <BarChart3 className="w-5 h-5" />
+        </button>
+
+        <button
+          onClick={() => setActiveSidePanel((p) => (p === 'transcript' ? 'none' : 'transcript'))}
+          className={`relative p-3 rounded-2xl shrink-0 min-w-[44px] min-h-[44px] flex items-center justify-center transition-colors ${
+            activeSidePanel === 'transcript'
+              ? 'bg-sky-600 text-white'
+              : isTranscribing
+              ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-600/30'
+              : 'bg-slate-800 hover:bg-slate-700'
+          }`}
+          title="AI Live Transcript"
+        >
+          <FileText className="w-5 h-5" />
+          {isTranscribing && (
+            <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+          )}
         </button>
 
         {isHostOrMod && (

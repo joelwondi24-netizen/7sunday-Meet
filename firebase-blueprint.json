@@ -162,6 +162,25 @@
       },
       "required": ["id", "meetingId", "meetingCode", "participantUid", "participantName", "joinedAt", "durationSeconds", "createdAt"]
     },
+    "MeetingTranscriptEntry": {
+      "title": "MeetingTranscriptEntry",
+      "description": "AI-transcribed or manual live transcript segment saved during an active meeting.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "meetingCode": { "type": "string", "minLength": 3, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "speakerUid": { "type": "string", "maxLength": 128 },
+        "speakerName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "language": { "type": "string", "maxLength": 32 },
+        "source": { "type": "string", "enum": ["gemini_ai", "gemini_summary", "manual_note"] },
+        "meetingScope": { "type": "string", "enum": ["internal", "customer", "external"] },
+        "participantUids": { "type": "array" },
+        "timestampLabel": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "meetingCode", "speakerUid", "speakerName", "text", "source", "meetingScope", "timestampLabel", "createdAt"]
+    },
     "ChatConversation": {
       "title": "ChatConversation",
       "description": "Scoped conversation room (employee_dm, employee_group, customer_dm, customer_community, support).",
@@ -418,6 +437,10 @@
     "/meeting_attendance/{recordId}": {
       "schema": { "$ref": "#/entities/MeetingAttendance" },
       "description": "Participant attendance duration logs for meetings."
+    },
+    "/meeting_transcripts/{entryId}": {
+      "schema": { "$ref": "#/entities/MeetingTranscriptEntry" },
+      "description": "AI-transcribed and manual live transcript entries saved during active meetings."
     },
     "/chats/{chatId}": {
       "schema": { "$ref": "#/entities/ChatConversation" },

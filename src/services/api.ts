@@ -128,4 +128,47 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to sync order with DMS');
     return resp.json();
   },
+
+  async transcribeMeetingAudio(params: {
+    audioBlob: Blob;
+    meetingCode: string;
+    speakerName: string;
+    languageHint?: string;
+  }): Promise<{ text: string; isEmpty: boolean }> {
+    const headers = await getAuthHeaders();
+    const audioBase64 = await fileToBase64(params.audioBlob);
+    const resp = await fetch('/api/meetings/transcribe', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        audioBase64,
+        mimeType: params.audioBlob.type || 'audio/webm',
+        meetingCode: params.meetingCode,
+        speakerName: params.speakerName,
+        languageHint: params.languageHint || 'auto',
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'AI transcription failed');
+    }
+    return resp.json();
+  },
+
+  async summarizeMeetingTranscript(params: {
+    meetingCode: string;
+    entries: Array<{ speakerName: string; timestampLabel: string; text: string }>;
+  }): Promise<{ summary: string }> {
+    const headers = await getAuthHeaders();
+    const resp = await fetch('/api/meetings/summarize', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(params),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'AI summary generation failed');
+    }
+    return resp.json();
+  },
 };

@@ -8,14 +8,31 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { initializeApp, getApps, getApp } from 'firebase-admin/app';
 import { getAuth, DecodedIdToken } from 'firebase-admin/auth';
+import { GoogleGenAI } from '@google/genai';
+
+function getGeminiClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY is not configured in environment secrets.');
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Initialize Firebase Admin ONLY for verifyIdToken (needs no IAM)
 const firebaseConfigPath = path.resolve(__dirname, 'firebase-applet-config.json');
-let firebaseProjectId = '';
-if (fs.existsSync(firebaseConfigPath)) {
+let firebaseProjectId =
+  process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID || '';
+if (!firebaseProjectId && fs.existsSync(firebaseConfigPath)) {
   try {
     const raw = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf-8'));
     firebaseProjectId = raw.projectId || '';
@@ -30,6 +47,7 @@ const adminApp = getApps().length
 const adminAuth = getAuth(adminApp);
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '16mb' }));
 app.use(express.urlencoded({ extended: true, limit: '16mb' }));
 
@@ -94,6 +112,7 @@ interface ActiveRoom {
   meetingCode: string;
   clients: Map<string, { ws: WebSocket; participant: any }>;
   chatHistory: any[];
+  transcripts: any[];
   whiteboardStrokes: any[];
   activePolls: any[];
   isLocked: boolean;
@@ -114,6 +133,7 @@ function getOrCreateRoom(code: string): ActiveRoom {
       meetingCode: code,
       clients: new Map(),
       chatHistory: [],
+      transcripts: [],
       whiteboardStrokes: [],
       activePolls: [],
       isLocked: meta?.isLocked || false,
@@ -404,6 +424,105 @@ app.post('/api/dms/sync-order', requireFirebaseAuth, async (req: AuthenticatedRe
   }
 });
 
+// AI-powered meeting audio transcription via Gemini (server-side)
+app.post('/api/meetings/transcribe', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { audioBase64, mimeType, speakerName, languageHint } = req.body || {};
+    if (!audioBase64 || typeof audioBase64 !== 'string') {
+      return res.status(400).json({ error: 'audioBase64 payload is required.' });
+    }
+
+    const cleanBase64 = audioBase64.includes(',') ? audioBase64.split(',')[1] : audioBase64;
+    const byteSize = Buffer.from(cleanBase64, 'base64').length;
+    if (byteSize === 0 || byteSize > 10 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Audio chunk must be between 1 byte and 10 MB.' });
+    }
+
+    const rawMime = typeof mimeType === 'string' && mimeType.trim() ? mimeType.trim() : 'audio/webm';
+    const cleanMime = rawMime.split(';')[0].trim() || 'audio/webm';
+
+    const ai = getGeminiClient();
+    const hintText =
+      typeof languageHint === 'string' && languageHint.trim() && languageHint !== 'auto'
+        ? ` Expected spoken language hint: ${languageHint.trim()}.`
+        : '';
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.5-transcribe',
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType: cleanMime,
+              data: cleanBase64,
+            },
+          },
+          {
+            text:
+              `Transcribe only the clearly spoken speech from this live meeting audio clip spoken by ${typeof speakerName === 'string' ? speakerName.slice(0, 80) : 'a participant'}.` +
+              `${hintText} Return only the verbatim transcript text with proper punctuation. ` +
+              `If there is only silence, background noise, or no intelligible speech, return an empty string.`,
+          },
+        ],
+      },
+    });
+
+    const rawText = (response.text ?? '').trim();
+    const normalized = /^(?:\[?(?:silence|no speech|inaudible|background noise|music|none|empty)\]?\.?)$/i.test(rawText)
+      ? ''
+      : rawText;
+
+    return res.json({
+      text: normalized.slice(0, 4000),
+      isEmpty: normalized.length === 0,
+    });
+  } catch (err: any) {
+    console.error('Meeting transcription error:', err);
+    const statusCode = typeof err?.status === 'number' && err.status >= 400 ? err.status : 500;
+    return res.status(statusCode).json({
+      error: err?.message || 'Failed to transcribe meeting audio.',
+    });
+  }
+});
+
+// AI-powered meeting transcript summarization & action items via Gemini (server-side)
+app.post('/api/meetings/summarize', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { meetingCode, entries } = req.body || {};
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: 'At least one transcript entry is required to summarize.' });
+    }
+
+    const formattedTranscript = entries
+      .slice(-150)
+      .map((e: any) => `[${String(e.timestampLabel || '')}] ${String(e.speakerName || 'Participant')}: ${String(e.text || '')}`)
+      .join('\n')
+      .slice(0, 24000);
+
+    const ai = getGeminiClient();
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: `Meeting Code: ${String(meetingCode || 'N/A')}\n\nTranscript:\n${formattedTranscript}`,
+      config: {
+        systemInstruction:
+          'You are an executive meeting assistant for Seven Sunday Ethiopia. Summarize the meeting transcript concisely in plain markdown-free text with three brief sections: Overview, Key Decisions, and Action Items. Keep total length under 1500 characters and rely strictly on the provided transcript.',
+      },
+    });
+
+    const summary = (response.text ?? '').trim();
+    if (!summary) {
+      return res.status(502).json({ error: 'No summary text was generated.' });
+    }
+    return res.json({ summary: summary.slice(0, 4000) });
+  } catch (err: any) {
+    console.error('Meeting summarization error:', err);
+    const statusCode = typeof err?.status === 'number' && err.status >= 400 ? err.status : 500;
+    return res.status(statusCode).json({
+      error: err?.message || 'Failed to summarize meeting transcript.',
+    });
+  }
+});
+
 // -----------------------------------------------------------------------------
 // WebSocket Server for Real-Time WebRTC Signaling & Meeting Collaboration
 // -----------------------------------------------------------------------------
@@ -508,6 +627,7 @@ wss.on('connection', (ws: WebSocket) => {
               meetingCode,
               participants: existingParticipants,
               chatHistory: room.chatHistory,
+              transcripts: room.transcripts,
               whiteboardStrokes: room.whiteboardStrokes,
               polls: room.activePolls,
               isLocked: room.isLocked,
@@ -619,6 +739,21 @@ wss.on('connection', (ws: WebSocket) => {
           break;
         }
 
+        case 'transcript-entry': {
+          const entry = payload?.entry;
+          if (!entry || typeof entry.text !== 'string') break;
+          room.transcripts.push(entry);
+          if (room.transcripts.length > 200) {
+            room.transcripts = room.transcripts.slice(-200);
+          }
+          room.clients.forEach(({ ws: clientWs }, id) => {
+            if (id !== participantId && clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ type: 'transcript-entry-added', entry }));
+            }
+          });
+          break;
+        }
+
         case 'whiteboard-stroke': {
           room.whiteboardStrokes.push(payload.stroke);
           room.clients.forEach(({ ws: clientWs }, id) => {
@@ -703,6 +838,7 @@ wss.on('connection', (ws: WebSocket) => {
                   participant: admittedParticipant,
                   participants: Array.from(room.clients.values()).map((c) => c.participant),
                   chatHistory: room.chatHistory,
+                  transcripts: room.transcripts,
                   whiteboardStrokes: room.whiteboardStrokes,
                   polls: room.activePolls,
                 })
@@ -760,6 +896,7 @@ wss.on('connection', (ws: WebSocket) => {
                   participant: admittedParticipant,
                   participants: Array.from(room.clients.values()).map((c) => c.participant),
                   chatHistory: room.chatHistory,
+                  transcripts: room.transcripts,
                   whiteboardStrokes: room.whiteboardStrokes,
                   polls: room.activePolls,
                 })

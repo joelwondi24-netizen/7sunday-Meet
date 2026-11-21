@@ -8,6 +8,7 @@
 5. **Server Timestamp Integrity**: All `createdAt` and `updatedAt` timestamps on write must match `request.time`.
 6. **Master Gate on Subcollections**: `/chats/{chatId}/messages/{msgId}` checks parent chat membership (`request.auth.uid in get(...).data.memberUids`) and enforces scope isolation.
 7. **Order Ownership**: Customers can only create and read `/orders/{orderId}` where `customerUid == request.auth.uid`, and cannot arbitrarily alter order status after submission.
+8. **Transcript Scope & Ownership**: `/meeting_transcripts/{entryId}` is immutable after creation, enforces `speakerUid == request.auth.uid`, and prevents customer accounts from reading or writing `internal` meeting transcripts.
 
 ## The Dirty Dozen Adversarial Payloads
 1. Customer trying to create `/users/{uid}` with `role: "Super Administrator"`. -> **Expected: PERMISSION_DENIED**
@@ -22,3 +23,4 @@
 10. Customer setting `status: "delivered"` when creating an order in `/orders/{orderId}`. -> **Expected: PERMISSION_DENIED**
 11. User injecting a 2KB string into document ID (`{meetingId}`) or shadow field `isVerified: true`. -> **Expected: PERMISSION_DENIED**
 12. Any user attempting to `update` or `delete` `/audit_logs/{logId}`. -> **Expected: PERMISSION_DENIED**
+13. Customer creating or reading an `internal` transcript entry or spoofing `speakerUid` in `/meeting_transcripts/{entryId}`. -> **Expected: PERMISSION_DENIED**

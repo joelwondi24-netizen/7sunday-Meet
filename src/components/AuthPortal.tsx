@@ -22,8 +22,11 @@ import {
   AlertCircle,
   RefreshCw,
   KeyRound,
+  Copy,
+  Check,
+  ExternalLink,
 } from 'lucide-react';
-import { auth, CORPORATE_EMAIL_DOMAIN, googleAuthProvider } from '../lib/firebase';
+import { activeFirebaseConfig, auth, CORPORATE_EMAIL_DOMAIN, googleAuthProvider } from '../lib/firebase';
 import { provisionOwnProfile } from '../services/firestoreService';
 import { UserPrivateProfile } from '../types';
 
@@ -54,7 +57,51 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [unauthorizedDomain, setUnauthorizedDomain] = useState<string | null>(null);
+  const [copiedDomain, setCopiedDomain] = useState(false);
   const [pendingVerifyUser, setPendingVerifyUser] = useState<FirebaseUser | null>(null);
+
+  const mapAuthError = (err: any, fallback: string): string => {
+    const code = err?.code as string | undefined;
+    if (code === 'auth/unauthorized-domain') {
+      const host = typeof window !== 'undefined' ? window.location.hostname : '';
+      setUnauthorizedDomain(host || 'current-domain');
+      return `The domain "${host || 'this domain'}" is not authorized for Google OAuth sign-in in Firebase.`;
+    }
+    if (code === 'auth/popup-blocked') {
+      return 'Sign-in popup was blocked by your browser. Please allow popups for this site and try again, or sign in with Email & Password below.';
+    }
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+      return 'Google sign-in popup was closed before completing authentication.';
+    }
+    if (code === 'auth/operation-not-allowed') {
+      return 'Email/Password sign-in is not yet enabled in Firebase Console -> Authentication -> Sign-in method. Please enable it or use Google Sign-In above.';
+    }
+    if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
+      return 'Invalid email or password. Check your credentials or use Forgot password.';
+    }
+    if (code === 'auth/email-already-in-use') {
+      return 'An account with this email already exists. Switch to Sign In or reset your password.';
+    }
+    if (code === 'auth/weak-password') {
+      return 'Password must be at least 6 characters long.';
+    }
+    if (code === 'auth/too-many-requests') {
+      return 'Too many authentication attempts. Please wait a moment and try again.';
+    }
+    return err?.message || fallback;
+  };
+
+  const handleCopyDomain = async () => {
+    if (!unauthorizedDomain) return;
+    try {
+      await navigator.clipboard.writeText(unauthorizedDomain);
+      setCopiedDomain(true);
+      setTimeout(() => setCopiedDomain(false), 2000);
+    } catch {
+      // Clipboard API unavailable
+    }
+  };
 
   const finalizeProfile = async (fbUser: FirebaseUser, portal: 'employee' | 'customer' | 'admin') => {
     const profile = await provisionOwnProfile(fbUser, portal, {
@@ -72,12 +119,13 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
     if (activePortal === 'guest') return;
     setError(null);
     setNotice(null);
+    setUnauthorizedDomain(null);
     setLoading(true);
     try {
       const result = await signInWithPopup(auth, googleAuthProvider);
       await finalizeProfile(result.user, activePortal);
     } catch (err: any) {
-      setError(err?.message || 'Google sign-in failed.');
+      setError(mapAuthError(err, 'Google sign-in failed.'));
     } finally {
       setLoading(false);
     }
@@ -88,6 +136,7 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
     if (activePortal === 'guest') return;
     setError(null);
     setNotice(null);
+    setUnauthorizedDomain(null);
 
     if (mode === 'reset') {
       if (!email.trim()) {
@@ -100,7 +149,7 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
         setNotice('Password reset link sent. Check your inbox.');
         setMode('signin');
       } catch (err: any) {
-        setError(err?.message || 'Failed to send password reset email.');
+        setError(mapAuthError(err, 'Failed to send password reset email.'));
       } finally {
         setLoading(false);
       }
@@ -140,13 +189,7 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
       }
       await finalizeProfile(fbUser, activePortal);
     } catch (err: any) {
-      if (err?.code === 'auth/operation-not-allowed') {
-        setError(
-          'Email/Password sign-in is not yet enabled in Firebase Console -> Authentication -> Sign-in method. Please enable it or use Google Sign-In above.'
-        );
-      } else {
-        setError(err?.message || 'Authentication failed.');
-      }
+      setError(mapAuthError(err, 'Authentication failed.'));
     } finally {
       setLoading(false);
     }
@@ -275,6 +318,7 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
                     setActivePortal(tab.id as PortalTab);
                     setError(null);
                     setNotice(null);
+                    setUnauthorizedDomain(null);
                     setPendingVerifyUser(null);
                     if (tab.id === 'admin') setMode('signin');
                   }}
@@ -292,9 +336,49 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
           </div>
 
           {error && (
-            <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-xs flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-              <span>{error}</span>
+            <div className="mb-4 p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-700 dark:text-rose-300 text-xs space-y-2.5">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-600 dark:text-rose-400" />
+                <span className="font-medium leading-relaxed">{error}</span>
+              </div>
+
+              {unauthorizedDomain && (
+                <div className="pl-6 space-y-2 text-[11px] text-slate-700 dark:text-slate-300">
+                  <p className="leading-relaxed">
+                    Add this host under <strong>Firebase Console → Authentication → Settings → Authorized domains</strong> for project{' '}
+                    <code className="px-1.5 py-0.5 rounded bg-slate-200/80 dark:bg-slate-800 font-mono text-[10px]">
+                      {activeFirebaseConfig.projectId}
+                    </code>
+                    :
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <code className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-mono text-[11px] text-slate-900 dark:text-white break-all">
+                      {unauthorizedDomain}
+                    </code>
+                    <button
+                      type="button"
+                      onClick={handleCopyDomain}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 dark:bg-slate-700 text-white font-semibold hover:bg-slate-800 transition-colors"
+                    >
+                      {copiedDomain ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedDomain ? 'Copied' : 'Copy Domain'}</span>
+                    </button>
+                    <a
+                      href={`https://console.firebase.google.com/project/${activeFirebaseConfig.projectId}/authentication/settings`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-600 text-white font-semibold hover:bg-sky-500 transition-colors"
+                    >
+                      <span>Open Firebase Settings</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <p className="text-slate-500 dark:text-slate-400">
+                    Tip: You can also sign in with <strong>Email & Password</strong> below, join via <strong>Guest Join</strong>, or configure your own{' '}
+                    <code className="font-mono">VITE_FIREBASE_*</code> environment variables on Render.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 

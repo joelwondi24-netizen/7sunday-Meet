@@ -335,14 +335,17 @@ function MainApp() {
 
   // Authenticated Active Meeting Room
   if (activeRoomCode) {
+    const activeMeeting = meetings.find((m) => m.code === activeRoomCode);
     return (
       <MeetingRoom
         meetingCode={activeRoomCode}
+        meetingScope={activeMeeting?.meetingScope}
         currentUser={{
           uid: currentUser.uid,
           displayName: currentUser.displayName,
           email: currentUser.email,
           role: currentUser.role,
+          accountType: currentUser.accountType,
           avatarUrl: currentUser.avatarUrl,
           isAuthenticated: true,
           dndMode: currentUser.dndMode,
