@@ -1,0 +1,12 @@
+{
+  "name": "Seven Sunday Connect",
+  "description": "Enterprise video conferencing, collaborative meetings, webinars, reports and organization communications platform by Seven Sunday Manufacturing & Trading PLC.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

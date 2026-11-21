@@ -1,0 +1,1036 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Pillar 0: Default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Authenticated connectivity check document (zero open reads)
+    match /test/connection {
+      allow get: if isSignedIn();
+      allow list, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Global Helper Primitives
+    // -------------------------------------------------------------------------
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isVerified() && request.auth.uid == uid;
+    }
+
+    function isBootstrapAdmin() {
+      return isVerified() && request.auth.token.email == 'joelwondi24@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrapAdmin() || (
+        isVerified() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function hasUserProfile() {
+      return isVerified() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function userAccountType() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountType;
+    }
+
+    function userRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isEmployeeOrAdmin() {
+      return isAdmin() || (
+        hasUserProfile() &&
+        (userAccountType() == 'employee' || userAccountType() == 'admin')
+      );
+    }
+
+    function isCustomer() {
+      return hasUserProfile() && userAccountType() == 'customer';
+    }
+
+    function isSupportAgent() {
+      return isEmployeeOrAdmin() && (
+        isAdmin() ||
+        userRole() == 'Customer Service Agent' ||
+        userRole() == 'Company Administrator' ||
+        userRole() == 'Super Administrator'
+      );
+    }
+
+    function isModerator() {
+      return isAdmin() || isSupportAgent() || (
+        isEmployeeOrAdmin() &&
+        userRole() in ['Meeting Moderator', 'Meeting Administrator', 'HR Manager']
+      );
+    }
+
+    function isValidOptionalString(data, field, maxLen) {
+      return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isValidOptionalBool(data, field) {
+      return !(field in data) || (data[field] is bool);
+    }
+
+    function isValidStringList(data, field, maxCount) {
+      return !(field in data) || (
+        data[field] is list &&
+        data[field].size() <= maxCount &&
+        (data[field].size() == 0 || data[field][0] is string)
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // Entity Validation Blueprints (Pillar 2)
+    // -------------------------------------------------------------------------
+    function isValidUserPrivateProfile(data, uid) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'accountType', 'role', 'status', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'uid', 'email', 'phone', 'displayName', 'accountType', 'role', 'status',
+          'department', 'jobTitle', 'avatarUrl', 'mfaEnabled', 'biometricEnabled',
+          'dndMode', 'presenceStatus', 'statusMessage', 'blockedUids', 'contactUids',
+          'favoriteUids', 'lastSyncAt', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.uid) &&
+        data.uid == uid &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        isValidOptionalString(data, 'phone', 40) &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.accountType in ['employee', 'customer', 'admin'] &&
+        data.role in [
+          'Super Administrator', 'Company Administrator', 'IT Administrator', 'HR Manager',
+          'Department Manager', 'Meeting Administrator', 'Meeting Organizer', 'Meeting Moderator',
+          'Employee', 'Customer Service Agent', 'Customer', 'External Guest'
+        ] &&
+        data.status in ['active', 'inactive', 'suspended', 'blocked_temp', 'blocked_perm', 'deleted'] &&
+        isValidOptionalString(data, 'department', 100) &&
+        isValidOptionalString(data, 'jobTitle', 100) &&
+        isValidOptionalString(data, 'avatarUrl', 500) &&
+        isValidOptionalBool(data, 'mfaEnabled') &&
+        isValidOptionalBool(data, 'biometricEnabled') &&
+        isValidOptionalBool(data, 'dndMode') &&
+        (!('presenceStatus' in data) || data.presenceStatus in ['online', 'in_meeting', 'away', 'busy', 'dnd', 'offline']) &&
+        isValidOptionalString(data, 'statusMessage', 160) &&
+        isValidStringList(data, 'blockedUids', 100) &&
+        isValidStringList(data, 'contactUids', 200) &&
+        isValidStringList(data, 'favoriteUids', 100) &&
+        isValidOptionalString(data, 'lastSyncAt', 64) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidDirectoryProfile(data, uid) {
+      return data.keys().hasAll(['uid', 'displayName', 'accountType', 'role', 'status', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'uid', 'displayName', 'accountType', 'role', 'department', 'jobTitle',
+          'avatarUrl', 'presenceStatus', 'statusMessage', 'status', 'updatedAt'
+        ]) &&
+        isValidId(data.uid) &&
+        data.uid == uid &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.accountType in ['employee', 'customer', 'admin'] &&
+        data.role is string && data.role.size() >= 1 && data.role.size() <= 64 &&
+        data.status in ['active', 'inactive', 'suspended', 'blocked_temp', 'blocked_perm', 'deleted'] &&
+        isValidOptionalString(data, 'department', 100) &&
+        isValidOptionalString(data, 'jobTitle', 100) &&
+        isValidOptionalString(data, 'avatarUrl', 500) &&
+        (!('presenceStatus' in data) || data.presenceStatus in ['online', 'in_meeting', 'away', 'busy', 'dnd', 'offline']) &&
+        isValidOptionalString(data, 'statusMessage', 160) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAdminMarker(data, uid) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'role', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.uid == uid &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.role in ['Super Administrator', 'Company Administrator'] &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidUserSession(data, uid, sessionId) {
+      return data.keys().hasAll(['id', 'uid', 'deviceName', 'platform', 'authMethod', 'revoked', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'uid', 'deviceName', 'platform', 'authMethod', 'revoked', 'createdAt']) &&
+        isValidId(data.id) && data.id == sessionId &&
+        isValidId(data.uid) && data.uid == uid &&
+        data.deviceName is string && data.deviceName.size() >= 1 && data.deviceName.size() <= 160 &&
+        data.platform is string && data.platform.size() >= 1 && data.platform.size() <= 80 &&
+        data.authMethod is string && data.authMethod.size() >= 1 && data.authMethod.size() <= 80 &&
+        data.revoked is bool &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidDepartment(data, deptId) {
+      return data.keys().hasAll(['id', 'name', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'name', 'description', 'managerUid', 'createdAt']) &&
+        isValidId(data.id) && data.id == deptId &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        isValidOptionalString(data, 'description', 500) &&
+        isValidOptionalString(data, 'managerUid', 128) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidCustomRole(data, roleId) {
+      return data.keys().hasAll(['id', 'name', 'accountScope', 'permissions', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'name', 'accountScope', 'permissions', 'updatedAt']) &&
+        isValidId(data.id) && data.id == roleId &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+        data.accountScope in ['employee', 'customer', 'admin'] &&
+        data.permissions is map &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMeeting(data, meetingId) {
+      return data.keys().hasAll([
+        'id', 'code', 'title', 'meetingScope', 'type', 'priority', 'status',
+        'hostUid', 'hostName', 'scheduledStart', 'scheduledEnd', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'code', 'title', 'description', 'agenda', 'meetingScope', 'type',
+        'callMode', 'capacity', 'isPermanentRoom', 'priority',
+        'status', 'hostUid', 'hostName', 'organizerUid', 'moderatorUids', 'department',
+        'scheduledStart', 'scheduledEnd', 'timezone', 'recurrenceRule', 'waitingRoomEnabled',
+        'isLocked', 'hasPassword', 'allowScreenShare', 'allowChat', 'allowWhiteboard',
+        'recordingConsentRequired', 'participantUids', 'invitedEmails', 'documentUrls',
+        'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) && data.id == meetingId &&
+      data.code is string && data.code.size() >= 3 && data.code.size() <= 64 && data.code.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+      isValidOptionalString(data, 'description', 2000) &&
+      isValidOptionalString(data, 'agenda', 4000) &&
+      data.meetingScope in ['internal', 'customer', 'external'] &&
+      data.type in ['instant', 'scheduled', 'recurring', 'webinar', 'classroom', 'conference_room', 'virtual_room'] &&
+      (!('callMode' in data) || data.callMode in ['video', 'audio']) &&
+      (!('capacity' in data) || (data.capacity is number && data.capacity >= 1 && data.capacity <= 1000)) &&
+      isValidOptionalBool(data, 'isPermanentRoom') &&
+      data.priority in ['low', 'normal', 'high', 'urgent'] &&
+      data.status in ['waiting', 'live', 'ended', 'cancelled'] &&
+      isValidId(data.hostUid) &&
+      data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 120 &&
+      isValidOptionalString(data, 'organizerUid', 128) &&
+      isValidStringList(data, 'moderatorUids', 20) &&
+      isValidOptionalString(data, 'department', 100) &&
+      data.scheduledStart is string && data.scheduledStart.size() >= 4 && data.scheduledStart.size() <= 64 &&
+      data.scheduledEnd is string && data.scheduledEnd.size() >= 4 && data.scheduledEnd.size() <= 64 &&
+      isValidOptionalString(data, 'timezone', 80) &&
+      (!('recurrenceRule' in data) || data.recurrenceRule in ['none', 'daily', 'weekly', 'monthly']) &&
+      isValidOptionalBool(data, 'waitingRoomEnabled') &&
+      isValidOptionalBool(data, 'isLocked') &&
+      isValidOptionalBool(data, 'hasPassword') &&
+      isValidOptionalBool(data, 'allowScreenShare') &&
+      isValidOptionalBool(data, 'allowChat') &&
+      isValidOptionalBool(data, 'allowWhiteboard') &&
+      isValidOptionalBool(data, 'recordingConsentRequired') &&
+      isValidStringList(data, 'participantUids', 100) &&
+      isValidStringList(data, 'invitedEmails', 100) &&
+      isValidStringList(data, 'documentUrls', 25) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidMeetingAttendance(data, recordId) {
+      return data.keys().hasAll([
+        'id', 'meetingId', 'meetingCode', 'participantUid', 'participantName',
+        'joinedAt', 'durationSeconds', 'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'meetingId', 'meetingCode', 'meetingTitle', 'participantUid',
+        'participantName', 'participantRole', 'joinedAt', 'leftAt', 'durationSeconds', 'createdAt'
+      ]) &&
+      isValidId(data.id) && data.id == recordId &&
+      isValidId(data.meetingId) &&
+      data.meetingCode is string && data.meetingCode.size() >= 3 && data.meetingCode.size() <= 64 &&
+      isValidOptionalString(data, 'meetingTitle', 200) &&
+      isValidId(data.participantUid) &&
+      data.participantName is string && data.participantName.size() >= 1 && data.participantName.size() <= 120 &&
+      isValidOptionalString(data, 'participantRole', 64) &&
+      data.joinedAt is string && data.joinedAt.size() <= 64 &&
+      isValidOptionalString(data, 'leftAt', 64) &&
+      data.durationSeconds is number && data.durationSeconds >= 0 &&
+      data.createdAt is timestamp;
+    }
+
+    function isValidChatConversation(data, chatId) {
+      return data.keys().hasAll(['id', 'chatScope', 'memberUids', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'chatScope', 'name', 'description', 'memberUids', 'adminUids',
+          'assignedAgentUid', 'orderId', 'lastMessage', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) && data.id == chatId &&
+        data.chatScope in ['employee_dm', 'employee_group', 'customer_dm', 'customer_community', 'support'] &&
+        isValidOptionalString(data, 'name', 150) &&
+        isValidOptionalString(data, 'description', 500) &&
+        data.memberUids is list && data.memberUids.size() >= 1 && data.memberUids.size() <= 100 &&
+        data.memberUids[0] is string &&
+        isValidStringList(data, 'adminUids', 25) &&
+        isValidOptionalString(data, 'assignedAgentUid', 128) &&
+        isValidOptionalString(data, 'orderId', 128) &&
+        isValidOptionalString(data, 'lastMessage', 500) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidChatMessage(data, msgId) {
+      return data.keys().hasAll(['id', 'senderUid', 'senderName', 'senderAccountType', 'content', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'senderUid', 'senderName', 'senderAccountType', 'content',
+          'attachmentUrl', 'attachmentName', 'attachmentType', 'attachmentSizeBytes',
+          'replyToId', 'replyToPreview',
+          'forwardedFrom', 'voiceNoteUrl', 'voiceNoteDurationSec', 'edited', 'deleted',
+          'moderated', 'moderationReason',
+          'pinned', 'bookmarkedByUids', 'reportedByUids', 'readByUids', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) && data.id == msgId &&
+        isValidId(data.senderUid) &&
+        data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 120 &&
+        data.senderAccountType in ['employee', 'customer', 'admin'] &&
+        data.content is string && data.content.size() <= 4000 &&
+        isValidOptionalString(data, 'attachmentUrl', 600) &&
+        isValidOptionalString(data, 'attachmentName', 200) &&
+        isValidOptionalString(data, 'attachmentType', 100) &&
+        (!('attachmentSizeBytes' in data) || (data.attachmentSizeBytes is number && data.attachmentSizeBytes >= 0)) &&
+        isValidOptionalString(data, 'replyToId', 128) &&
+        isValidOptionalString(data, 'replyToPreview', 300) &&
+        isValidOptionalString(data, 'forwardedFrom', 120) &&
+        isValidOptionalString(data, 'voiceNoteUrl', 600) &&
+        (!('voiceNoteDurationSec' in data) || (data.voiceNoteDurationSec is number && data.voiceNoteDurationSec >= 0)) &&
+        isValidOptionalBool(data, 'edited') &&
+        isValidOptionalBool(data, 'deleted') &&
+        isValidOptionalBool(data, 'moderated') &&
+        isValidOptionalString(data, 'moderationReason', 200) &&
+        isValidOptionalBool(data, 'pinned') &&
+        isValidStringList(data, 'bookmarkedByUids', 100) &&
+        isValidStringList(data, 'reportedByUids', 100) &&
+        isValidStringList(data, 'readByUids', 100) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidScheduledMessage(data, chatId, schedId) {
+      return data.keys().hasAll(['id', 'chatId', 'senderUid', 'senderName', 'content', 'scheduledFor', 'status', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'chatId', 'senderUid', 'senderName', 'content', 'scheduledFor', 'status', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) && data.id == schedId &&
+        isValidId(data.chatId) && data.chatId == chatId &&
+        isValidId(data.senderUid) &&
+        data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 120 &&
+        data.content is string && data.content.size() >= 1 && data.content.size() <= 4000 &&
+        data.scheduledFor is string && data.scheduledFor.size() >= 4 && data.scheduledFor.size() <= 64 &&
+        data.status in ['scheduled', 'sent', 'cancelled'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidModerationReport(data, reportId) {
+      return data.keys().hasAll([
+        'id', 'chatId', 'messageId', 'messageContent', 'reportedUid', 'reportedName',
+        'reporterUid', 'reporterName', 'reason', 'status', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'chatId', 'messageId', 'messageContent', 'reportedUid', 'reportedName',
+        'reporterUid', 'reporterName', 'reason', 'details', 'status',
+        'reviewedByUid', 'resolutionNote', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) && data.id == reportId &&
+      isValidId(data.chatId) &&
+      isValidId(data.messageId) &&
+      data.messageContent is string && data.messageContent.size() <= 1000 &&
+      isValidId(data.reportedUid) &&
+      data.reportedName is string && data.reportedName.size() >= 1 && data.reportedName.size() <= 120 &&
+      isValidId(data.reporterUid) &&
+      data.reporterName is string && data.reporterName.size() >= 1 && data.reporterName.size() <= 120 &&
+      data.reason in ['spam', 'harassment', 'phishing', 'inappropriate', 'other'] &&
+      isValidOptionalString(data, 'details', 500) &&
+      data.status in ['pending', 'removed', 'dismissed'] &&
+      isValidOptionalString(data, 'reviewedByUid', 128) &&
+      isValidOptionalString(data, 'resolutionNote', 500) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidReportEntry(data, reportId) {
+      return data.keys().hasAll(['id', 'title', 'category', 'content', 'authorUid', 'authorName', 'visibility', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'title', 'category', 'description', 'content', 'authorUid', 'authorName',
+          'department', 'visibility', 'pinned', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) && data.id == reportId &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 80 &&
+        isValidOptionalString(data, 'description', 1000) &&
+        data.content is string && data.content.size() >= 1 && data.content.size() <= 15000 &&
+        isValidId(data.authorUid) &&
+        data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 120 &&
+        isValidOptionalString(data, 'department', 100) &&
+        data.visibility in ['internal', 'customer_public'] &&
+        isValidOptionalBool(data, 'pinned') &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidProduct(data, productId) {
+      return data.keys().hasAll([
+        'id', 'name', 'category', 'price', 'currency', 'stockStatus', 'active',
+        'createdByUid', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'name', 'category', 'description', 'price', 'currency', 'imageUrl',
+        'stockStatus', 'active', 'createdByUid', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) && data.id == productId &&
+      data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+      data.category is string && data.category.size() >= 1 && data.category.size() <= 80 &&
+      isValidOptionalString(data, 'description', 2000) &&
+      data.price is number && data.price >= 0 &&
+      data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16 &&
+      isValidOptionalString(data, 'imageUrl', 600) &&
+      data.stockStatus in ['in_stock', 'made_to_order', 'out_of_stock'] &&
+      data.active is bool &&
+      isValidId(data.createdByUid) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidCustomerOrder(data, orderId) {
+      return data.keys().hasAll([
+        'id', 'orderNumber', 'customerUid', 'customerName', 'customerEmail',
+        'items', 'totalAmount', 'currency', 'status', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'orderNumber', 'customerUid', 'customerName', 'customerEmail',
+        'items', 'totalAmount', 'currency', 'status', 'shippingAddress', 'notes',
+        'invoiceNumber', 'dmsSyncStatus', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) && data.id == orderId &&
+      data.orderNumber is string && data.orderNumber.size() >= 1 && data.orderNumber.size() <= 64 &&
+      isValidId(data.customerUid) &&
+      data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 120 &&
+      data.customerEmail is string && data.customerEmail.size() >= 3 && data.customerEmail.size() <= 200 &&
+      data.items is list && data.items.size() >= 1 && data.items.size() <= 50 &&
+      data.items[0] is map &&
+      data.totalAmount is number && data.totalAmount >= 0 &&
+      data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16 &&
+      data.status in ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled'] &&
+      isValidOptionalString(data, 'shippingAddress', 400) &&
+      isValidOptionalString(data, 'notes', 1000) &&
+      isValidOptionalString(data, 'invoiceNumber', 64) &&
+      (!('dmsSyncStatus' in data) || data.dmsSyncStatus in ['not_configured', 'queued', 'synced', 'error']) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidNotificationItem(data, notifId) {
+      return data.keys().hasAll(['id', 'recipientUid', 'type', 'title', 'body', 'read', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'recipientUid', 'senderUid', 'type', 'callMode', 'title', 'body', 'read', 'link', 'createdAt']) &&
+        isValidId(data.id) && data.id == notifId &&
+        isValidId(data.recipientUid) &&
+        isValidOptionalString(data, 'senderUid', 128) &&
+        data.type in ['meeting_reminder', 'meeting_invite', 'meeting_update', 'call_invite', 'message', 'order_update', 'support_reply', 'security_alert'] &&
+        (!('callMode' in data) || data.callMode in ['audio', 'video']) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 180 &&
+        data.body is string && data.body.size() >= 1 && data.body.size() <= 1000 &&
+        data.read is bool &&
+        isValidOptionalString(data, 'link', 300) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidAuditLog(data, logId) {
+      return data.keys().hasAll(['id', 'actorUid', 'actorEmail', 'actorRole', 'action', 'targetType', 'details', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'actorUid', 'actorEmail', 'actorRole', 'action', 'targetType', 'targetId', 'details', 'createdAt']) &&
+        isValidId(data.id) && data.id == logId &&
+        isValidId(data.actorUid) &&
+        data.actorEmail is string && data.actorEmail.size() >= 3 && data.actorEmail.size() <= 200 &&
+        data.actorRole is string && data.actorRole.size() >= 1 && data.actorRole.size() <= 80 &&
+        data.action is string && data.action.size() >= 1 && data.action.size() <= 120 &&
+        data.targetType is string && data.targetType.size() >= 1 && data.targetType.size() <= 80 &&
+        isValidOptionalString(data, 'targetId', 128) &&
+        data.details is string && data.details.size() >= 1 && data.details.size() <= 1000 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidIntegrationConfig(data, configId) {
+      return data.keys().hasAll(['id', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'whatsappEnabled', 'whatsappBusinessNumber', 'telegramEnabled', 'telegramBotUsername',
+          'emailEnabled', 'smtpHost', 'smsEnabled', 'smsSenderId', 'sevenSundayDmsEndpoint', 'updatedAt'
+        ]) &&
+        isValidId(data.id) && data.id == configId &&
+        isValidOptionalBool(data, 'whatsappEnabled') &&
+        isValidOptionalString(data, 'whatsappBusinessNumber', 64) &&
+        isValidOptionalBool(data, 'telegramEnabled') &&
+        isValidOptionalString(data, 'telegramBotUsername', 100) &&
+        isValidOptionalBool(data, 'emailEnabled') &&
+        isValidOptionalString(data, 'smtpHost', 180) &&
+        isValidOptionalBool(data, 'smsEnabled') &&
+        isValidOptionalString(data, 'smsSenderId', 64) &&
+        isValidOptionalString(data, 'sevenSundayDmsEndpoint', 300) &&
+        data.updatedAt is timestamp;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection Rules
+    // -------------------------------------------------------------------------
+
+    // 1. /users/{uid} - Strictly isolated PII
+    match /users/{uid} {
+      allow get: if isValidId(uid) && (isOwner(uid) || isAdmin());
+      allow list: if isVerified() && (resource.data.uid == request.auth.uid || isAdmin());
+
+      allow create: if isValidId(uid) &&
+        isVerified() &&
+        isValidUserPrivateProfile(incoming(), uid) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isAdmin() || (
+            uid == request.auth.uid &&
+            incoming().email == request.auth.token.email &&
+            incoming().status == 'active' && (
+              (isBootstrapAdmin() && incoming().accountType == 'admin' && incoming().role == 'Super Administrator') ||
+              (incoming().accountType == 'customer' && incoming().role == 'Customer') ||
+              (incoming().accountType == 'employee' && incoming().role == 'Employee' &&
+               incoming().email.matches('^[^@]+@sevensundayethiopia\\.com$'))
+            )
+          )
+        );
+
+      allow update: if isValidId(uid) &&
+        isVerified() &&
+        isValidUserPrivateProfile(incoming(), uid) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() || (
+            isOwner(uid) &&
+            incoming().accountType == existing().accountType &&
+            incoming().role == existing().role &&
+            incoming().status == existing().status &&
+            incoming().email == existing().email &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName', 'phone', 'department', 'jobTitle', 'avatarUrl',
+              'mfaEnabled', 'biometricEnabled', 'dndMode', 'presenceStatus', 'statusMessage',
+              'blockedUids', 'contactUids', 'favoriteUids', 'lastSyncAt', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(uid) && isAdmin() && uid != request.auth.uid;
+
+      // User login sessions & device tracking
+      match /sessions/{sessionId} {
+        allow get: if isValidId(uid) && isValidId(sessionId) && (isOwner(uid) || isAdmin());
+        allow list: if isValidId(uid) && isVerified() && (resource.data.uid == request.auth.uid || isAdmin());
+        allow create: if isValidId(uid) && isValidId(sessionId) &&
+          isOwner(uid) &&
+          isValidUserSession(incoming(), uid, sessionId) &&
+          incoming().createdAt == request.time &&
+          incoming().revoked == false;
+        allow update: if isValidId(uid) && isValidId(sessionId) &&
+          (isOwner(uid) || isAdmin()) &&
+          isValidUserSession(incoming(), uid, sessionId) &&
+          incoming().uid == existing().uid &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['revoked']);
+        allow delete: if isValidId(uid) && isValidId(sessionId) && (isOwner(uid) || isAdmin());
+      }
+    }
+
+    // 2. /directory_profiles/{uid} - Non-PII scoped directory
+    match /directory_profiles/{uid} {
+      allow get: if isValidId(uid) && isVerified() && (
+        isOwner(uid) ||
+        isEmployeeOrAdmin() ||
+        (isCustomer() && (existing().accountType == 'customer' || existing().role == 'Customer Service Agent'))
+      );
+
+      allow list: if isVerified() && (
+        isEmployeeOrAdmin() ||
+        resource.data.uid == request.auth.uid ||
+        resource.data.accountType == 'customer' ||
+        resource.data.role == 'Customer Service Agent'
+      );
+
+      allow create: if isValidId(uid) &&
+        isVerified() &&
+        isValidDirectoryProfile(incoming(), uid) &&
+        incoming().updatedAt == request.time && (
+          isAdmin() || (
+            uid == request.auth.uid &&
+            incoming().status == 'active' && (
+              (isBootstrapAdmin() && incoming().accountType == 'admin' && incoming().role == 'Super Administrator') ||
+              (incoming().accountType == 'customer' && incoming().role == 'Customer') ||
+              (incoming().accountType == 'employee' && incoming().role == 'Employee' &&
+               request.auth.token.email.matches('^[^@]+@sevensundayethiopia\\.com$'))
+            )
+          )
+        );
+
+      allow update: if isValidId(uid) &&
+        isVerified() &&
+        isValidDirectoryProfile(incoming(), uid) &&
+        incoming().uid == existing().uid &&
+        incoming().updatedAt == request.time && (
+          isAdmin() || (
+            isOwner(uid) &&
+            incoming().accountType == existing().accountType &&
+            incoming().role == existing().role &&
+            incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName', 'department', 'jobTitle', 'avatarUrl', 'presenceStatus', 'statusMessage', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(uid) && isAdmin();
+    }
+
+    // 3. /admins/{uid} - Admin marker lookup
+    match /admins/{uid} {
+      allow get: if isValidId(uid) && isVerified() && (isOwner(uid) || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if isValidId(uid) &&
+        isVerified() &&
+        isValidAdminMarker(incoming(), uid) &&
+        incoming().createdAt == request.time && (
+          (isBootstrapAdmin() && uid == request.auth.uid) ||
+          isAdmin()
+        );
+      allow delete: if isValidId(uid) && isAdmin() && uid != request.auth.uid;
+    }
+
+    // 4. /departments/{deptId} - Employee & Admin only
+    match /departments/{deptId} {
+      allow get: if isValidId(deptId) && isEmployeeOrAdmin();
+      allow list: if isEmployeeOrAdmin();
+      allow create: if isValidId(deptId) && isAdmin() && isValidDepartment(incoming(), deptId) && incoming().createdAt == request.time;
+      allow update: if isValidId(deptId) && isAdmin() && isValidDepartment(incoming(), deptId) &&
+        incoming().id == existing().id && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(deptId) && isAdmin();
+    }
+
+    // 5. /custom_roles/{roleId} - Admin RBAC Matrix
+    match /custom_roles/{roleId} {
+      allow get: if isValidId(roleId) && isEmployeeOrAdmin();
+      allow list: if isEmployeeOrAdmin();
+      allow create, update: if isValidId(roleId) && isAdmin() &&
+        isValidCustomRole(incoming(), roleId) &&
+        incoming().updatedAt == request.time;
+      allow delete: if isValidId(roleId) && isAdmin();
+    }
+
+    // 6. /meetings/{meetingId} - Scope-isolated meetings
+    match /meetings/{meetingId} {
+      allow get: if isValidId(meetingId) && isVerified() && (
+        isAdmin() ||
+        isEmployeeOrAdmin() ||
+        (existing().meetingScope in ['customer', 'external'] && (
+          existing().hostUid == request.auth.uid ||
+          request.auth.uid in existing().participantUids ||
+          request.auth.token.email in existing().invitedEmails
+        ))
+      );
+
+      allow list: if isVerified() && (
+        isEmployeeOrAdmin() ||
+        resource.data.hostUid == request.auth.uid ||
+        request.auth.uid in resource.data.participantUids ||
+        request.auth.token.email in resource.data.invitedEmails
+      );
+
+      allow create: if isValidId(meetingId) &&
+        isVerified() &&
+        isValidMeeting(incoming(), meetingId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        incoming().hostUid == request.auth.uid && (
+          isEmployeeOrAdmin() ||
+          (isCustomer() && incoming().meetingScope in ['customer', 'external'])
+        );
+
+      allow update: if isValidId(meetingId) &&
+        isVerified() &&
+        isValidMeeting(incoming(), meetingId) &&
+        incoming().id == existing().id &&
+        incoming().hostUid == existing().hostUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() || (
+            existing().status != 'ended' &&
+            existing().status != 'cancelled' && (
+              (
+                (existing().hostUid == request.auth.uid || request.auth.uid in existing().moderatorUids) &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'title', 'description', 'agenda', 'priority', 'status', 'callMode', 'capacity',
+                  'scheduledStart', 'scheduledEnd', 'timezone', 'recurrenceRule', 'waitingRoomEnabled',
+                  'isLocked', 'hasPassword', 'allowScreenShare', 'allowChat', 'allowWhiteboard',
+                  'recordingConsentRequired', 'participantUids', 'invitedEmails', 'documentUrls',
+                  'moderatorUids', 'updatedAt'
+                ])
+              ) || (
+                isEmployeeOrAdmin() &&
+                incoming().diff(existing()).affectedKeys().hasOnly(['participantUids', 'updatedAt'])
+              )
+            )
+          )
+        );
+
+      allow delete: if isValidId(meetingId) && isVerified() && (isAdmin() || existing().hostUid == request.auth.uid);
+    }
+
+    // 7. /meeting_attendance/{recordId}
+    match /meeting_attendance/{recordId} {
+      allow get: if isValidId(recordId) && isVerified() && (isEmployeeOrAdmin() || existing().participantUid == request.auth.uid);
+      allow list: if isVerified() && (isEmployeeOrAdmin() || resource.data.participantUid == request.auth.uid);
+      allow create: if isValidId(recordId) && isVerified() &&
+        isValidMeetingAttendance(incoming(), recordId) &&
+        incoming().participantUid == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if isValidId(recordId) && isVerified() &&
+        isValidMeetingAttendance(incoming(), recordId) &&
+        existing().participantUid == request.auth.uid &&
+        incoming().participantUid == existing().participantUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['leftAt', 'durationSeconds']);
+      allow delete: if isValidId(recordId) && isAdmin();
+    }
+
+    // 8. /chats/{chatId} & /messages/{msgId} - Strict Scope Isolation + Master Gate
+    match /chats/{chatId} {
+      allow get: if isValidId(chatId) && isVerified() && (
+        isAdmin() ||
+        (request.auth.uid in existing().memberUids && (
+          (existing().chatScope in ['employee_dm', 'employee_group'] && isEmployeeOrAdmin()) ||
+          (existing().chatScope in ['customer_dm', 'customer_community'] && isCustomer()) ||
+          existing().chatScope == 'support'
+        )) ||
+        (existing().chatScope == 'customer_community' && isCustomer()) ||
+        (existing().chatScope == 'support' && isSupportAgent())
+      );
+
+      allow list: if isVerified() && (
+        isAdmin() ||
+        (resource.data.chatScope in ['employee_dm', 'employee_group'] && isEmployeeOrAdmin() && request.auth.uid in resource.data.memberUids) ||
+        (resource.data.chatScope == 'customer_dm' && isCustomer() && request.auth.uid in resource.data.memberUids) ||
+        (resource.data.chatScope == 'customer_community' && isCustomer()) ||
+        (resource.data.chatScope == 'support' && (isSupportAgent() || request.auth.uid in resource.data.memberUids))
+      );
+
+      allow create: if isValidId(chatId) &&
+        isVerified() &&
+        isValidChatConversation(incoming(), chatId) &&
+        request.auth.uid in incoming().memberUids &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          (incoming().chatScope in ['employee_dm', 'employee_group'] && isEmployeeOrAdmin()) ||
+          (incoming().chatScope in ['customer_dm', 'customer_community'] && isCustomer()) ||
+          (incoming().chatScope == 'support' && (isCustomer() || isSupportAgent()))
+        );
+
+      allow update: if isValidId(chatId) &&
+        isVerified() &&
+        isValidChatConversation(incoming(), chatId) &&
+        incoming().id == existing().id &&
+        incoming().chatScope == existing().chatScope &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            (request.auth.uid in existing().memberUids || (existing().chatScope == 'customer_community' && isCustomer())) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['lastMessage', 'updatedAt'])
+          ) ||
+          (
+            existing().chatScope in ['employee_group', 'customer_community'] &&
+            (request.auth.uid in existing().adminUids || isSupportAgent()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'memberUids', 'adminUids', 'assignedAgentUid', 'lastMessage', 'updatedAt'])
+          ) ||
+          (
+            existing().chatScope == 'support' &&
+            isSupportAgent() &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'assignedAgentUid', 'lastMessage', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isValidId(chatId) && isAdmin();
+
+      // Master Gate Subcollection: /chats/{chatId}/messages/{msgId}
+      match /messages/{msgId} {
+        allow get: if isValidId(chatId) && isValidId(msgId) && isVerified() && (
+          isAdmin() ||
+          request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.memberUids ||
+          (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'customer_community' && isCustomer()) ||
+          (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'support' && isSupportAgent())
+        );
+
+        allow list: if isValidId(chatId) && isVerified() && (
+          isAdmin() ||
+          request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.memberUids ||
+          (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'customer_community' && isCustomer()) ||
+          (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'support' && isSupportAgent())
+        );
+
+        allow create: if isValidId(chatId) && isValidId(msgId) &&
+          isVerified() &&
+          isValidChatMessage(incoming(), msgId) &&
+          incoming().senderUid == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/chats/$(chatId)) && (
+            isAdmin() ||
+            request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.memberUids ||
+            (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'customer_community' && isCustomer()) ||
+            (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'support' && isSupportAgent())
+          );
+
+        allow update: if isValidId(chatId) && isValidId(msgId) &&
+          isVerified() &&
+          isValidChatMessage(incoming(), msgId) &&
+          incoming().id == existing().id &&
+          incoming().senderUid == existing().senderUid &&
+          incoming().senderAccountType == existing().senderAccountType &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/chats/$(chatId)) && (
+            isAdmin() ||
+            (
+              isModerator() &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['content', 'deleted', 'moderated', 'moderationReason', 'pinned', 'updatedAt'])
+            ) ||
+            (
+              existing().senderUid == request.auth.uid &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['content', 'edited', 'deleted', 'pinned', 'updatedAt'])
+            ) ||
+            (
+              (
+                request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.memberUids ||
+                (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'customer_community' && isCustomer()) ||
+                (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'support' && isSupportAgent())
+              ) &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['bookmarkedByUids', 'reportedByUids', 'readByUids', 'pinned', 'updatedAt'])
+            )
+          );
+
+        allow delete: if isValidId(chatId) && isValidId(msgId) && isVerified() && (
+          isAdmin() || existing().senderUid == request.auth.uid
+        );
+      }
+
+      // Sender-private scheduled messages inside a conversation
+      match /scheduled_messages/{schedId} {
+        allow get: if isValidId(chatId) && isValidId(schedId) && isVerified() && (
+          isAdmin() || existing().senderUid == request.auth.uid
+        );
+        allow list: if isValidId(chatId) && isVerified() && (
+          isAdmin() || resource.data.senderUid == request.auth.uid
+        );
+        allow create: if isValidId(chatId) && isValidId(schedId) &&
+          isVerified() &&
+          isValidScheduledMessage(incoming(), chatId, schedId) &&
+          incoming().senderUid == request.auth.uid &&
+          incoming().status == 'scheduled' &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/chats/$(chatId)) && (
+            isAdmin() ||
+            request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.memberUids ||
+            (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'customer_community' && isCustomer()) ||
+            (get(/databases/$(database)/documents/chats/$(chatId)).data.chatScope == 'support' && isSupportAgent())
+          );
+        allow update: if isValidId(chatId) && isValidId(schedId) &&
+          isVerified() &&
+          isValidScheduledMessage(incoming(), chatId, schedId) &&
+          existing().senderUid == request.auth.uid &&
+          existing().status == 'scheduled' &&
+          incoming().id == existing().id &&
+          incoming().chatId == existing().chatId &&
+          incoming().senderUid == existing().senderUid &&
+          incoming().senderName == existing().senderName &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['content', 'scheduledFor', 'status', 'updatedAt']);
+        allow delete: if isValidId(chatId) && isValidId(schedId) && isVerified() && (
+          isAdmin() || existing().senderUid == request.auth.uid
+        );
+      }
+    }
+
+    // 8b. /moderation_reports/{reportId} - Spam & abuse reporting + moderator review
+    match /moderation_reports/{reportId} {
+      allow get: if isValidId(reportId) && isVerified() && (isModerator() || existing().reporterUid == request.auth.uid);
+      allow list: if isVerified() && (isModerator() || resource.data.reporterUid == request.auth.uid);
+      allow create: if isValidId(reportId) && isVerified() &&
+        isValidModerationReport(incoming(), reportId) &&
+        incoming().reporterUid == request.auth.uid &&
+        incoming().status == 'pending' &&
+        !('reviewedByUid' in incoming()) &&
+        !('resolutionNote' in incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(reportId) && isModerator() &&
+        isValidModerationReport(incoming(), reportId) &&
+        existing().status == 'pending' &&
+        incoming().status in ['removed', 'dismissed'] &&
+        incoming().reviewedByUid == request.auth.uid &&
+        incoming().id == existing().id &&
+        incoming().reporterUid == existing().reporterUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reviewedByUid', 'resolutionNote', 'updatedAt']);
+      allow delete: if isValidId(reportId) && isAdmin();
+    }
+
+    // 9. /reports/{reportId} - Company reports & announcements
+    match /reports/{reportId} {
+      allow get: if isValidId(reportId) && isVerified() && (isEmployeeOrAdmin() || existing().visibility == 'customer_public');
+      allow list: if isVerified() && (isEmployeeOrAdmin() || resource.data.visibility == 'customer_public');
+      allow create: if isValidId(reportId) && isEmployeeOrAdmin() &&
+        isValidReportEntry(incoming(), reportId) &&
+        incoming().authorUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(reportId) && isEmployeeOrAdmin() &&
+        isValidReportEntry(incoming(), reportId) &&
+        incoming().id == existing().id &&
+        incoming().authorUid == existing().authorUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() || (
+            existing().authorUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'title', 'category', 'description', 'content', 'department', 'visibility', 'pinned', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if isValidId(reportId) && (isAdmin() || (isEmployeeOrAdmin() && existing().authorUid == request.auth.uid));
+    }
+
+    // 10. /products/{productId} - Public/Customer catalog, Admin managed
+    match /products/{productId} {
+      allow get: if isValidId(productId) && isVerified() && (existing().active == true || isEmployeeOrAdmin());
+      allow list: if isVerified() && (resource.data.active == true || isAdmin());
+      allow create: if isValidId(productId) && isAdmin() &&
+        isValidProduct(incoming(), productId) &&
+        incoming().createdByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(productId) && isAdmin() &&
+        isValidProduct(incoming(), productId) &&
+        incoming().id == existing().id &&
+        incoming().createdByUid == existing().createdByUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+      allow delete: if isValidId(productId) && isAdmin();
+    }
+
+    // 11. /orders/{orderId} - Customer owned, Staff managed
+    match /orders/{orderId} {
+      allow get: if isValidId(orderId) && isVerified() && (
+        existing().customerUid == request.auth.uid || isSupportAgent() || isAdmin()
+      );
+      allow list: if isVerified() && (
+        resource.data.customerUid == request.auth.uid || isSupportAgent() || isAdmin()
+      );
+      allow create: if isValidId(orderId) &&
+        isVerified() &&
+        isValidCustomerOrder(incoming(), orderId) &&
+        incoming().customerUid == request.auth.uid &&
+        incoming().status == 'pending' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(orderId) &&
+        isVerified() &&
+        isValidCustomerOrder(incoming(), orderId) &&
+        incoming().id == existing().id &&
+        incoming().customerUid == existing().customerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() || (
+            existing().status != 'delivered' &&
+            existing().status != 'cancelled' && (
+              (
+                isSupportAgent() &&
+                incoming().diff(existing()).affectedKeys().hasOnly(['status', 'dmsSyncStatus', 'notes', 'updatedAt'])
+              ) || (
+                existing().customerUid == request.auth.uid &&
+                existing().status == 'pending' &&
+                incoming().status == 'cancelled' &&
+                incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+              )
+            )
+          )
+        );
+      allow delete: if isValidId(orderId) && isAdmin();
+    }
+
+    // 12. /notifications/{notifId} - Recipient scoped
+    match /notifications/{notifId} {
+      allow get: if isValidId(notifId) && isVerified() && (existing().recipientUid == request.auth.uid || isAdmin());
+      allow list: if isVerified() && (resource.data.recipientUid == request.auth.uid || isAdmin());
+      allow create: if isValidId(notifId) && isVerified() &&
+        isValidNotificationItem(incoming(), notifId) &&
+        incoming().read == false &&
+        incoming().createdAt == request.time && (
+          isEmployeeOrAdmin() ||
+          incoming().recipientUid == request.auth.uid ||
+          (
+            'senderUid' in incoming() &&
+            incoming().senderUid == request.auth.uid &&
+            incoming().type in ['message', 'call_invite', 'meeting_invite', 'support_reply']
+          )
+        );
+      allow update: if isValidId(notifId) && isVerified() &&
+        isValidNotificationItem(incoming(), notifId) &&
+        existing().recipientUid == request.auth.uid &&
+        incoming().recipientUid == existing().recipientUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+      allow delete: if isValidId(notifId) && isVerified() && (existing().recipientUid == request.auth.uid || isAdmin());
+    }
+
+    // 13. /audit_logs/{logId} - Append-only immutable trail
+    match /audit_logs/{logId} {
+      allow get: if isValidId(logId) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(logId) && isVerified() &&
+        isValidAuditLog(incoming(), logId) &&
+        incoming().actorUid == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    // 14. /integration_configs/{configId} - Admin only
+    match /integration_configs/{configId} {
+      allow get: if isValidId(configId) && isAdmin();
+      allow list: if isAdmin();
+      allow create, update: if isValidId(configId) && isAdmin() &&
+        isValidIntegrationConfig(incoming(), configId) &&
+        incoming().updatedAt == request.time;
+      allow delete: if isValidId(configId) && isAdmin();
+    }
+  }
+}
